@@ -1,4 +1,7 @@
-torch==2.5.1
+--find-links https://download.pytorch.org/whl/cu124
+torch==2.1.2+cu124
+torchvision==0.16.2+cu124
+torchaudio==2.1.2+cu124
 transformers==4.47.1
 accelerate==1.2.1
 bitsandbytes==0.45.0
