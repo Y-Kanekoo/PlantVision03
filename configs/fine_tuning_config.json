@@ -1,0 +1,68 @@
+{
+    "model_config": {
+        "base_model_path": "models/llama_4bit",
+        "output_dir": "models/fine_tuned",
+        "torch_dtype": "float16"
+    },
+    "lora_config": {
+        "r": 64,
+        "alpha": 128,
+        "dropout": 0.05,
+        "bias": "none",
+        "target_modules": [
+            "q_proj",
+            "v_proj",
+            "k_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj"
+        ]
+    },
+    "training_config": {
+        "num_epochs": 3,
+        "batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "learning_rate": 2e-4,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.03,
+        "evaluation_strategy": "steps",
+        "eval_steps": 500,
+        "save_strategy": "steps",
+        "save_steps": 500,
+        "logging_steps": 50
+    },
+    "data_config": {
+        "train_file": "data/instruction_dataset/train.jsonl",
+        "validation_file": "data/instruction_dataset/val.jsonl",
+        "test_file": "data/instruction_dataset/test.jsonl",
+        "max_source_length": 512,
+        "max_target_length": 512,
+        "image_size": 224,
+        "image_mean": [
+            0.485,
+            0.456,
+            0.406
+        ],
+        "image_std": [
+            0.229,
+            0.224,
+            0.225
+        ]
+    },
+    "evaluation_config": {
+        "metrics": [
+            "accuracy",
+            "f1",
+            "roc_auc"
+        ],
+        "generate_config": {
+            "max_new_tokens": 512,
+            "min_new_tokens": 10,
+            "temperature": 0.7,
+            "do_sample": true,
+            "top_p": 0.9,
+            "top_k": 50
+        }
+    }
+}
