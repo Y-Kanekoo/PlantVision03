@@ -5,19 +5,21 @@ LoRAを使用して効率的な学習を実現します
 
 import os
 import json
+import math
 import logging
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Union, Tuple
+from dataclasses import dataclass, field
 from PIL import Image
 import evaluate
 from tqdm import tqdm
 import transformers
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
+    MllamaForConditionalGeneration,
+    AutoProcessor,
+    MllamaProcessor,
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq
@@ -30,6 +32,10 @@ from peft import (
 )
 from datasets import load_dataset
 import wandb
+from einops import rearrange
+import torchvision.transforms as T
+from torchmetrics.classification import MulticlassF1Score
+from torchmetrics.text import BLEUScore
 
 # ログの設定
 logging.basicConfig(
@@ -45,6 +51,8 @@ class ModelArguments:
     base_model_path: str
     output_dir: str
     torch_dtype: str = "float16"
+    max_tiles: int = 4
+    image_aspect_ratio: str = "auto"
 
 
 @dataclass
@@ -53,11 +61,15 @@ class DataArguments:
     train_file: str
     validation_file: str
     test_file: str
-    max_source_length: int = 512
-    max_target_length: int = 512
+    max_source_length: int = 256
+    max_target_length: int = 256
     image_size: int = 224
-    image_mean: List[float] = None
-    image_std: List[float] = None
+    image_mean: List[float] = field(
+        default_factory=lambda: [0.485, 0.456, 0.406])
+    image_std: List[float] = field(
+        default_factory=lambda: [0.229, 0.224, 0.225])
+    max_num_images: int = 1
+    max_num_tiles: int = 4
 
 
 def load_config() -> Dict:
@@ -67,29 +79,92 @@ def load_config() -> Dict:
         return json.load(f)
 
 
-def preprocess_image(image_path: str, image_size: int, mean: List[float], std: List[float]) -> torch.Tensor:
+def get_aspect_ratio(image: Image.Image) -> Tuple[int, int]:
+    """画像のアスペクト比を計算"""
+    width, height = image.size
+    gcd = math.gcd(width, height)
+    return width // gcd, height // gcd
+
+
+def split_image_into_tiles(
+    image: Image.Image,
+    max_tiles: int,
+    target_size: Tuple[int, int]
+) -> List[Image.Image]:
+    """画像をタイルに分割"""
+    width, height = image.size
+    aspect_ratio = get_aspect_ratio(image)
+
+    if aspect_ratio[0] > aspect_ratio[1]:
+        # 横長の画像
+        num_tiles = min(max_tiles, aspect_ratio[0] // aspect_ratio[1])
+        tile_width = width // num_tiles
+        tiles = [
+            image.crop((i * tile_width, 0, (i + 1) * tile_width, height))
+            for i in range(num_tiles)
+        ]
+    else:
+        # 縦長の画像
+        num_tiles = min(max_tiles, aspect_ratio[1] // aspect_ratio[0])
+        tile_height = height // num_tiles
+        tiles = [
+            image.crop((0, i * tile_height, width, (i + 1) * tile_height))
+            for i in range(num_tiles)
+        ]
+
+    # タイルをリサイズ
+    tiles = [tile.resize(target_size) for tile in tiles]
+    return tiles
+
+
+def preprocess_image(
+    image_path: str,
+    data_args: DataArguments
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """画像の前処理"""
     image = Image.open(image_path).convert('RGB')
-    image = image.resize((image_size, image_size))
-    image = torch.tensor(image).float()
-    image = image.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
 
-    # 正規化
-    if mean is not None and std is not None:
-        mean = torch.tensor(mean).view(-1, 1, 1)
-        std = torch.tensor(std).view(-1, 1, 1)
-        image = (image / 255.0 - mean) / std
+    # タイルに分割
+    tiles = split_image_into_tiles(
+        image,
+        data_args.max_num_tiles,
+        (data_args.image_size, data_args.image_size)
+    )
 
-    return image
+    # 前処理の定義
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean=data_args.image_mean, std=data_args.image_std)
+    ])
+
+    # タイルの処理
+    processed_tiles = []
+    for tile in tiles:
+        processed_tiles.append(transform(tile))
+
+    # パディング
+    num_tiles = len(processed_tiles)
+    while len(processed_tiles) < data_args.max_num_tiles:
+        processed_tiles.append(torch.zeros_like(processed_tiles[0]))
+
+    # タイルの結合
+    tiles_tensor = torch.stack(processed_tiles)
+
+    # マスクの作成
+    mask = torch.zeros(data_args.max_num_tiles, dtype=torch.bool)
+    mask[:num_tiles] = True
+
+    return tiles_tensor, mask, num_tiles
 
 
-def preprocess_function(examples: Dict, tokenizer, data_args: DataArguments) -> Dict:
+def preprocess_function(examples: Dict, processor, data_args: DataArguments) -> Dict:
     """データの前処理"""
     model_inputs = {
         "input_ids": [],
         "attention_mask": [],
         "labels": [],
-        "pixel_values": []
+        "pixel_values": [],
+        "pixel_mask": []
     }
 
     for instruction, image_path, output in zip(
@@ -97,54 +172,59 @@ def preprocess_function(examples: Dict, tokenizer, data_args: DataArguments) -> 
         examples["image_path"],
         examples["output"]
     ):
-        # テキストの処理
-        source = f"{instruction}"
-        target = f"{output}"
+        # 画像の処理
+        pixel_values, pixel_mask, num_tiles = preprocess_image(
+            image_path,
+            data_args
+        )
 
-        source_ids = tokenizer(
-            source,
+        # テキストの処理
+        text_inputs = processor(
+            text=instruction,
+            add_special_tokens=True,
             max_length=data_args.max_source_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt"
         )
 
-        target_ids = tokenizer(
-            target,
+        text_outputs = processor(
+            text=output,
+            add_special_tokens=True,
             max_length=data_args.max_target_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt"
         )
 
-        # 画像の処理
-        image = preprocess_image(
-            image_path,
-            data_args.image_size,
-            data_args.image_mean,
-            data_args.image_std
-        )
+        model_inputs["input_ids"].append(text_inputs.input_ids)
+        model_inputs["attention_mask"].append(text_inputs.attention_mask)
+        model_inputs["labels"].append(text_outputs.input_ids)
+        model_inputs["pixel_values"].append(pixel_values)
+        model_inputs["pixel_mask"].append(pixel_mask)
 
-        model_inputs["input_ids"].append(source_ids["input_ids"])
-        model_inputs["attention_mask"].append(source_ids["attention_mask"])
-        model_inputs["labels"].append(target_ids["input_ids"])
-        model_inputs["pixel_values"].append(image)
+    # バッチ化
+    for key in model_inputs:
+        if key in ["pixel_values", "pixel_mask"]:
+            model_inputs[key] = torch.stack(model_inputs[key])
+        else:
+            model_inputs[key] = torch.cat(model_inputs[key])
 
     return model_inputs
 
 
-def create_model_and_tokenizer(model_args: ModelArguments) -> tuple:
-    """モデルとトークナイザーの作成"""
-    logger.info("Loading model and tokenizer...")
+def create_model_and_processor(model_args: ModelArguments) -> tuple:
+    """モデルとプロセッサーの作成"""
+    logger.info("Loading model and processor...")
 
-    # トークナイザーの読み込み
-    tokenizer = AutoTokenizer.from_pretrained(
+    # プロセッサーの読み込み
+    processor = AutoProcessor.from_pretrained(
         model_args.base_model_path,
         trust_remote_code=True
     )
 
     # モデルの読み込み
-    model = AutoModelForCausalLM.from_pretrained(
+    model = MllamaForConditionalGeneration.from_pretrained(
         model_args.base_model_path,
         torch_dtype=getattr(torch, model_args.torch_dtype),
         trust_remote_code=True
@@ -153,7 +233,7 @@ def create_model_and_tokenizer(model_args: ModelArguments) -> tuple:
     # 4bit量子化モデルの準備
     model = prepare_model_for_kbit_training(model)
 
-    return model, tokenizer
+    return model, processor
 
 
 def create_lora_model(model: nn.Module, config: Dict) -> nn.Module:
@@ -175,9 +255,27 @@ def create_lora_model(model: nn.Module, config: Dict) -> nn.Module:
     return model
 
 
+def compute_metrics(eval_preds):
+    """評価指標の計算"""
+    predictions, labels = eval_preds
+
+    # BLEUスコアの計算
+    bleu = BLEUScore()
+    bleu_score = bleu(predictions, labels)
+
+    # F1スコアの計算（マルチクラス）
+    f1 = MulticlassF1Score(num_classes=38)  # クラス数
+    f1_score = f1(predictions, labels)
+
+    return {
+        "bleu": bleu_score,
+        "f1": f1_score
+    }
+
+
 def create_trainer(
     model: nn.Module,
-    tokenizer,
+    processor,
     config: Dict,
     train_dataset,
     eval_dataset,
@@ -199,6 +297,8 @@ def create_trainer(
         save_strategy=config["training_config"]["save_strategy"],
         save_steps=config["training_config"]["save_steps"],
         logging_steps=config["training_config"]["logging_steps"],
+        max_grad_norm=config["training_config"]["max_grad_norm"],
+        lr_scheduler_type=config["training_config"]["lr_scheduler_type"],
         report_to="wandb"
     )
 
@@ -207,8 +307,9 @@ def create_trainer(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator
+        tokenizer=processor,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics
     )
 
     return trainer
@@ -233,18 +334,22 @@ def main():
         max_target_length=config["data_config"]["max_target_length"],
         image_size=config["data_config"]["image_size"],
         image_mean=config["data_config"]["image_mean"],
-        image_std=config["data_config"]["image_std"]
+        image_std=config["data_config"]["image_std"],
+        max_num_images=config["data_config"]["max_num_images"],
+        max_num_tiles=config["data_config"]["max_num_tiles"]
     )
 
     # モデル引数の作成
     model_args = ModelArguments(
         base_model_path=config["model_config"]["base_model_path"],
         output_dir=config["model_config"]["output_dir"],
-        torch_dtype=config["model_config"]["torch_dtype"]
+        torch_dtype=config["model_config"]["torch_dtype"],
+        max_tiles=config["model_config"]["max_tiles"],
+        image_aspect_ratio=config["model_config"]["image_aspect_ratio"]
     )
 
-    # モデルとトークナイザーの作成
-    model, tokenizer = create_model_and_tokenizer(model_args)
+    # モデルとプロセッサーの作成
+    model, processor = create_model_and_processor(model_args)
 
     # LoRAモデルの作成
     model = create_lora_model(model, config)
@@ -262,19 +367,21 @@ def main():
     # データの前処理
     logger.info("Preprocessing datasets...")
     train_dataset = dataset["train"].map(
-        lambda x: preprocess_function(x, tokenizer, data_args),
+        lambda x: preprocess_function(x, processor, data_args),
         batched=True,
-        remove_columns=dataset["train"].column_names
+        remove_columns=dataset["train"].column_names,
+        num_proc=4
     )
     eval_dataset = dataset["validation"].map(
-        lambda x: preprocess_function(x, tokenizer, data_args),
+        lambda x: preprocess_function(x, processor, data_args),
         batched=True,
-        remove_columns=dataset["validation"].column_names
+        remove_columns=dataset["validation"].column_names,
+        num_proc=4
     )
 
     # データコレーターの作成
     data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
+        processor,
         model=model,
         label_pad_token_id=-100,
         pad_to_multiple_of=8
@@ -283,22 +390,41 @@ def main():
     # トレーナーの作成
     trainer = create_trainer(
         model,
-        tokenizer,
+        processor,
         config,
         train_dataset,
         eval_dataset,
         data_collator
     )
 
-    # 学習の実行
-    logger.info("Starting training...")
-    trainer.train()
+    try:
+        # 学習の実行
+        logger.info("Starting training...")
+        train_result = trainer.train()
 
-    # モデルの保存
-    logger.info("Saving model...")
-    trainer.save_model()
+        # 学習結果の保存
+        logger.info("Saving final model...")
+        trainer.save_model()
 
-    logger.info("Fine-tuning completed!")
+        # 学習メトリクスの保存
+        metrics = train_result.metrics
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+
+        # 評価の実行
+        logger.info("Running evaluation...")
+        eval_metrics = trainer.evaluate()
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
+
+        logger.info("Training completed successfully!")
+
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}")
+        raise
+    finally:
+        # wandbのクリーンアップ
+        wandb.finish()
 
 
 if __name__ == "__main__":
