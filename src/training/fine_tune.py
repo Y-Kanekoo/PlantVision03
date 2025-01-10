@@ -36,13 +36,92 @@ from einops import rearrange
 import torchvision.transforms as T
 from torchmetrics.classification import MulticlassF1Score
 from torchmetrics.text import BLEUScore
+from .checkpoint_utils import CheckpointManager
 
 # ログの設定
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/training.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
+
+class CustomTrainer(Trainer):
+    """カスタムトレーナークラス"""
+
+    def __init__(self, *args, **kwargs):
+        """
+        初期化
+        チェックポイントマネージャーの設定を追加
+        """
+        super().__init__(*args, **kwargs)
+        self.checkpoint_manager = CheckpointManager()
+        self.best_loss = float('inf')
+
+    def training_step(self, model, inputs):
+        """
+        トレーニングステップ
+        損失値の計算と勾配の更新を行います
+        """
+        loss = super().training_step(model, inputs)
+
+        # 現在のステップ数を取得
+        current_step = self.state.global_step
+
+        # 定期的にチェックポイントを保存
+        if current_step % self.args.save_steps == 0:
+            self._save_checkpoint(model, loss.item())
+
+        return loss
+
+    def _save_checkpoint(self, model, loss):
+        """
+        チェックポイントの保存
+        モデルの状態と学習の進捗を保存します
+        """
+        metrics = self.evaluate()
+        self.checkpoint_manager.save_checkpoint(
+            model=model,
+            optimizer=self.optimizer,
+            scheduler=self.lr_scheduler,
+            epoch=self.state.epoch,
+            step=self.state.global_step,
+            loss=loss,
+            metrics=metrics
+        )
+
+        # 最良モデルの保存
+        if loss < self.best_loss:
+            self.best_loss = loss
+            self.save_model(os.path.join(self.args.output_dir, "best_model"))
+            logger.info(f"最良モデルを保存しました（損失値: {loss:.4f}）")
+
+        # 古いチェックポイントのクリーンアップ
+        self.checkpoint_manager.cleanup_old_checkpoints()
+
+    def train(self, resume_from_checkpoint=None, **kwargs):
+        """
+        学習の実行
+        チェックポイントからの再開機能を追加
+        """
+        if resume_from_checkpoint:
+            logger.info(f"チェックポイントから学習を再開: {resume_from_checkpoint}")
+            checkpoint = self.checkpoint_manager.load_latest_checkpoint(
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.lr_scheduler
+            )
+            if checkpoint:
+                self.state.epoch = checkpoint["epoch"]
+                self.state.global_step = checkpoint["step"]
+                logger.info(
+                    f"エポック {self.state.epoch}, ステップ {self.state.global_step} から再開します")
+
+        return super().train(**kwargs)
 
 
 @dataclass
@@ -299,10 +378,13 @@ def create_trainer(
         logging_steps=config["training_config"]["logging_steps"],
         max_grad_norm=config["training_config"]["max_grad_norm"],
         lr_scheduler_type=config["training_config"]["lr_scheduler_type"],
-        report_to="wandb"
+        report_to="wandb",
+        # チェックポイント関連の設定を追加
+        save_total_limit=3,  # 保持するチェックポイントの数
+        load_best_model_at_end=True,  # 学習終了時に最良モデルをロード
     )
 
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -319,105 +401,119 @@ def main():
     """メイン処理"""
     logger.info("Starting fine-tuning process...")
 
-    # 設定の読み込み
-    config = load_config()
-
-    # wandbの初期化
-    wandb.init(project="plant-vision", name="llama-3.2-vision-finetune")
-
-    # データ引数の作成
-    data_args = DataArguments(
-        train_file=config["data_config"]["train_file"],
-        validation_file=config["data_config"]["validation_file"],
-        test_file=config["data_config"]["test_file"],
-        max_source_length=config["data_config"]["max_source_length"],
-        max_target_length=config["data_config"]["max_target_length"],
-        image_size=config["data_config"]["image_size"],
-        image_mean=config["data_config"]["image_mean"],
-        image_std=config["data_config"]["image_std"],
-        max_num_images=config["data_config"]["max_num_images"],
-        max_num_tiles=config["data_config"]["max_num_tiles"]
-    )
-
-    # モデル引数の作成
-    model_args = ModelArguments(
-        base_model_path=config["model_config"]["base_model_path"],
-        output_dir=config["model_config"]["output_dir"],
-        torch_dtype=config["model_config"]["torch_dtype"],
-        max_tiles=config["model_config"]["max_tiles"],
-        image_aspect_ratio=config["model_config"]["image_aspect_ratio"]
-    )
-
-    # モデルとプロセッサーの作成
-    model, processor = create_model_and_processor(model_args)
-
-    # LoRAモデルの作成
-    model = create_lora_model(model, config)
-
-    # データセットの読み込み
-    logger.info("Loading datasets...")
-    dataset = load_dataset(
-        "json",
-        data_files={
-            "train": data_args.train_file,
-            "validation": data_args.validation_file
-        }
-    )
-
-    # データの前処理
-    logger.info("Preprocessing datasets...")
-    train_dataset = dataset["train"].map(
-        lambda x: preprocess_function(x, processor, data_args),
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-        num_proc=4
-    )
-    eval_dataset = dataset["validation"].map(
-        lambda x: preprocess_function(x, processor, data_args),
-        batched=True,
-        remove_columns=dataset["validation"].column_names,
-        num_proc=4
-    )
-
-    # データコレーターの作成
-    data_collator = DataCollatorForSeq2Seq(
-        processor,
-        model=model,
-        label_pad_token_id=-100,
-        pad_to_multiple_of=8
-    )
-
-    # トレーナーの作成
-    trainer = create_trainer(
-        model,
-        processor,
-        config,
-        train_dataset,
-        eval_dataset,
-        data_collator
-    )
-
     try:
-        # 学習の実行
-        logger.info("Starting training...")
-        train_result = trainer.train()
+        # 設定の読み込み
+        config = load_config()
 
-        # 学習結果の保存
-        logger.info("Saving final model...")
-        trainer.save_model()
+        # wandbの初期化
+        wandb.init(project="plant-vision", name="llama-3.2-vision-finetune")
 
-        # 学習メトリクスの保存
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
+        # データ引数の作成
+        data_args = DataArguments(
+            train_file=config["data_config"]["train_file"],
+            validation_file=config["data_config"]["validation_file"],
+            test_file=config["data_config"]["test_file"],
+            max_source_length=config["data_config"]["max_source_length"],
+            max_target_length=config["data_config"]["max_target_length"],
+            image_size=config["data_config"]["image_size"],
+            image_mean=config["data_config"]["image_mean"],
+            image_std=config["data_config"]["image_std"],
+            max_num_images=config["data_config"]["max_num_images"],
+            max_num_tiles=config["data_config"]["max_num_tiles"]
+        )
 
-        # 評価の実行
-        logger.info("Running evaluation...")
-        eval_metrics = trainer.evaluate()
-        trainer.log_metrics("eval", eval_metrics)
-        trainer.save_metrics("eval", eval_metrics)
+        # モデル引数の作成
+        model_args = ModelArguments(
+            base_model_path=config["model_config"]["base_model_path"],
+            output_dir=config["model_config"]["output_dir"],
+            torch_dtype=config["model_config"]["torch_dtype"],
+            max_tiles=config["model_config"]["max_tiles"],
+            image_aspect_ratio=config["model_config"]["image_aspect_ratio"]
+        )
 
-        logger.info("Training completed successfully!")
+        # モデルとプロセッサーの作成
+        model, processor = create_model_and_processor(model_args)
+
+        # LoRAモデルの作成
+        model = create_lora_model(model, config)
+
+        # データセットの読み込み
+        logger.info("Loading datasets...")
+        dataset = load_dataset(
+            "json",
+            data_files={
+                "train": data_args.train_file,
+                "validation": data_args.validation_file
+            }
+        )
+
+        # データの前処理
+        logger.info("Preprocessing datasets...")
+        train_dataset = dataset["train"].map(
+            lambda x: preprocess_function(x, processor, data_args),
+            batched=True,
+            remove_columns=dataset["train"].column_names,
+            num_proc=4
+        )
+        eval_dataset = dataset["validation"].map(
+            lambda x: preprocess_function(x, processor, data_args),
+            batched=True,
+            remove_columns=dataset["validation"].column_names,
+            num_proc=4
+        )
+
+        # データコレーターの作成
+        data_collator = DataCollatorForSeq2Seq(
+            processor,
+            model=model,
+            label_pad_token_id=-100,
+            pad_to_multiple_of=8
+        )
+
+        # トレーナーの作成
+        trainer = create_trainer(
+            model,
+            processor,
+            config,
+            train_dataset,
+            eval_dataset,
+            data_collator
+        )
+
+        # チェックポイントの確認
+        checkpoint_manager = CheckpointManager()
+        resume_from_checkpoint = None
+        if checkpoint_manager.metadata["last_checkpoint"]:
+            resume_from_checkpoint = True
+            logger.info("利用可能なチェックポイントが見つかりました")
+
+        try:
+            # 学習の実行
+            logger.info("Starting training...")
+            train_result = trainer.train(
+                resume_from_checkpoint=resume_from_checkpoint)
+
+            # 学習結果の保存
+            logger.info("Saving final model...")
+            trainer.save_model()
+
+            # 学習メトリクスの保存
+            metrics = train_result.metrics
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+
+            # 評価の実行
+            logger.info("Running evaluation...")
+            eval_metrics = trainer.evaluate()
+            trainer.log_metrics("eval", eval_metrics)
+            trainer.save_metrics("eval", eval_metrics)
+
+            logger.info("Training completed successfully!")
+
+        except KeyboardInterrupt:
+            logger.info("学習が中断されました。チェックポイントを保存します...")
+            trainer._save_checkpoint(trainer.model, trainer.state.global_step)
+            raise
 
     except Exception as e:
         logger.error(f"Error during training: {str(e)}")
