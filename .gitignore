@@ -1,49 +1,54 @@
-# 仮想環境関連ファイルとフォルダ
-venv/                 # 仮想環境ディレクトリを無視（ローカルで環境構築するため不要）
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Python キャッシュ関連ファイル
-__pycache__/          # Python実行時に生成されるキャッシュフォルダ
-*.pyc                 # コンパイル済みPythonファイル
-*.pyo                 # 最適化されたPythonファイル
-*.pyd                 # Windowsで生成されるバイナリモジュール
+# Virtual Environment
+venv/
+ENV/
 
-# 環境設定ファイル
-.venv                  # 環境変数を格納するファイル（機密情報を含む場合が多い）
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# Jupyter Notebook チェックポイント
-.ipynb_checkpoints/   # Jupyter Notebookが自動生成するチェックポイント
+# Data
+data/raw/
+data/processed/
+models/llama_4bit/
+*.zip
+*.tar.gz
 
-# ログファイル
-*.log                 # ログファイル（実行時の情報が含まれる）
+# Logs
+*.log
+wandb/
+logs/
+results/
 
-# 結果データや一時ファイル
-results/              # 学習や評価結果の保存ディレクトリ（生成物なので無視）
-*.tmp                 # 一時ファイル
-*.bak                 # バックアップファイル
-*.swp                 # Vimや他のエディタが生成するスワップファイル
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# モデル関連ファイル
-models/llama_4bit/    # 量子化済みモデル（生成物なので無視）
-models/fine_tuned/    # ファインチューニング済みモデル（生成物なので無視）
-
-# データセット関連
-data/raw/             # 生データセット（容量が大きいため無視）
-data/processed/       # 前処理済みデータ
-
-# IDE/エディタ関連
-.vscode/              # Visual Studio Codeの設定ファイル
-.idea/                # IntelliJ IDEAやPyCharmの設定ファイル
-*.sublime-project     # Sublime Textのプロジェクトファイル
-*.sublime-workspace   # Sublime Textのワークスペースファイル
-
-# GitHub関連
-.DS_Store             # macOSの隠しファイル
-Thumbs.db             # Windowsのサムネイルキャッシュ
-
-# バックアップと圧縮ファイル
-*.zip                 # 圧縮ファイル（バックアップ用）
-*.tar.gz              # 圧縮ファイル
-*.rar                 # 圧縮ファイル
-
-# その他無視するべきファイル
-wandb/                # Weights & Biasesのログや設定ファイルディレクトリ
+# OS
+.DS_Store
+Thumbs.db
