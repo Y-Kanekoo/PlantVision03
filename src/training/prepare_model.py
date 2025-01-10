@@ -1,5 +1,5 @@
 """
-Llama 3.2 11Bモデルのダウンロードと量子化を行うスクリプト
+Llama 3.2 11B Vision Instructモデルのダウンロードと量子化を行うスクリプト
 """
 
 import os
@@ -20,7 +20,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 定数の定義
-MODEL_ID = "meta-llama/Llama-2-11b-hf"  # Llama 3.2 11Bのモデル
+# Llama 3.2 11B Vision Instructモデル
+MODEL_ID = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 MODEL_DIR = Path("models/llama_4bit")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
